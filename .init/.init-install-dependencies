@@ -1,0 +1,4 @@
+{
+    "command": "cd db_visualizer && npm install",
+    "working_directory": "/home/kavia/workspace/code-generation/e-commerce-platform-with-real-time-order-management-40738-40747/ecommerce_database"
+}
