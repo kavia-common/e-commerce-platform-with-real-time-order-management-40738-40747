@@ -26,7 +26,7 @@ Prerequisites: PostgreSQL running on port 5000 with database/user created (start
    - Example:
      psql postgresql://appuser:dbuser123@localhost:5000/myapp
 
-2) Apply migrations:
+2) Apply migrations (localhost:5000, DB=myapp, user=appuser, pass=dbuser123):
 
 - Run all at once:
   psql postgresql://appuser:dbuser123@localhost:5000/myapp -f startup.sql
@@ -38,6 +38,10 @@ Prerequisites: PostgreSQL running on port 5000 with database/user created (start
 3) Verify:
   psql postgresql://appuser:dbuser123@localhost:5000/myapp -c "\\dt"
   psql postgresql://appuser:dbuser123@localhost:5000/myapp -c "SELECT * FROM users LIMIT 5"
+
+4) Troubleshooting:
+- Ensure Postgres is available on port 5000 and credentials match the backend DATABASE_URL.
+- Regenerate seed data by re-running startup.sql if needed.
 
 ## Notes
 
