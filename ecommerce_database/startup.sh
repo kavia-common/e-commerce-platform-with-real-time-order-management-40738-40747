@@ -1,83 +1,102 @@
 #!/bin/bash
+set -euo pipefail
 
-# Minimal PostgreSQL startup script with full paths
+# Minimal PostgreSQL startup script with robust readiness checks.
+# Internal Postgres will listen on standard port 5432 and all interfaces.
+# External port mapping (e.g., 3020->5432) is handled by the platform.
+
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
-DB_PORT="5000"
 
-echo "Starting PostgreSQL setup..."
+# Internal Postgres port inside the container
+INTERNAL_PG_PORT="5432"
+export PGPORT="${INTERNAL_PG_PORT}"
+
+echo "[startup] Starting PostgreSQL setup..."
 
 # Find PostgreSQL version and set paths
-PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
+PG_VERSION=$(ls /usr/lib/postgresql/ | head -1 || true)
+if [ -z "${PG_VERSION}" ]; then
+  echo "[startup][error] PostgreSQL binaries not found in /usr/lib/postgresql"
+  exit 1
+fi
 PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
-echo "Found PostgreSQL version: ${PG_VERSION}"
+echo "[startup] Found PostgreSQL version: ${PG_VERSION}"
+echo "[startup] Internal port: ${INTERNAL_PG_PORT}"
 
-# Check if PostgreSQL is already running on the specified port
-if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
-    echo "PostgreSQL is already running on port ${DB_PORT}!"
-    echo "Database: ${DB_NAME}"
-    echo "User: ${DB_USER}"
-    echo "Port: ${DB_PORT}"
-    echo ""
-    echo "To connect to the database, use:"
-    echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-    
-    # Check if connection info file exists
-    if [ -f "db_connection.txt" ]; then
-        echo "Or use: $(cat db_connection.txt)"
+# Helper to check readiness
+wait_for_ready() {
+  local retries=${1:-20}
+  local delay=${2:-2}
+  local i=1
+  while [ $i -le $retries ]; do
+    if sudo -u postgres "${PG_BIN}/pg_isready" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" > /dev/null 2>&1; then
+      echo "[startup] PostgreSQL is ready (attempt ${i}/${retries})"
+      return 0
     fi
-    
-    echo ""
-    echo "Script stopped - server already running."
-    exit 0
+    echo "[startup] Waiting for PostgreSQL to be ready... (${i}/${retries})"
+    sleep "${delay}"
+    i=$((i+1))
+  done
+  return 1
+}
+
+# If already ready, short-circuit
+if sudo -u postgres "${PG_BIN}/pg_isready" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" > /dev/null 2>&1; then
+  echo "[startup] PostgreSQL is already running on port ${INTERNAL_PG_PORT}"
+  echo "psql -h 127.0.0.1 -U ${DB_USER} -d ${DB_NAME} -p ${INTERNAL_PG_PORT}"
+  echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${INTERNAL_PG_PORT}/${DB_NAME}" > db_connection.txt
+  echo "[startup] Existing instance detected. Exiting."
+  exit 0
 fi
 
-# Also check if there's a PostgreSQL process running (in case pg_isready fails)
-if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
-    echo "Found existing PostgreSQL process on port ${DB_PORT}"
-    echo "Attempting to verify connection..."
-    
-    # Try to connect and verify the database exists
-    if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
-        echo "Database ${DB_NAME} is accessible."
-        echo "Script stopped - server already running."
-        exit 0
-    fi
+# Also check for existing postgres process with matching port
+if pgrep -f "postgres.*-p ${INTERNAL_PG_PORT}" > /dev/null 2>&1; then
+  echo "[startup] Found existing PostgreSQL process on port ${INTERNAL_PG_PORT}, verifying..."
+  if sudo -u postgres "${PG_BIN}/psql" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" -d postgres -c '\q' >/dev/null 2>&1; then
+    echo "[startup] Existing PostgreSQL instance is responsive."
+    echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${INTERNAL_PG_PORT}/${DB_NAME}" > db_connection.txt
+    exit 0
+  fi
 fi
 
 # Initialize PostgreSQL data directory if it doesn't exist
 if [ ! -f "/var/lib/postgresql/data/PG_VERSION" ]; then
-    echo "Initializing PostgreSQL..."
-    sudo -u postgres ${PG_BIN}/initdb -D /var/lib/postgresql/data
+  echo "[startup] Initializing PostgreSQL data directory..."
+  sudo -u postgres "${PG_BIN}/initdb" -D /var/lib/postgresql/data
 fi
 
-# Start PostgreSQL server in background
-echo "Starting PostgreSQL server..."
-sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
+# Start PostgreSQL server in background with explicit port and listen_addresses
+echo "[startup] Starting PostgreSQL server on 0.0.0.0:${INTERNAL_PG_PORT} ..."
+sudo -u postgres "${PG_BIN}/postgres" \
+  -D /var/lib/postgresql/data \
+  -p "${INTERNAL_PG_PORT}" \
+  -c listen_addresses='*' &
 
-# Wait for PostgreSQL to start
-echo "Waiting for PostgreSQL to start..."
-sleep 5
+# Wait for readiness
+if ! wait_for_ready 30 2; then
+  echo "[startup][error] PostgreSQL did not become ready on 127.0.0.1:${INTERNAL_PG_PORT} within timeout."
+  # Try to print last few lines of server log if available
+  if [ -f "/var/lib/postgresql/data/log/postgresql-%Y-%m-%d_%H%M%S.log" ]; then
+    echo "[startup] Recent PostgreSQL logs:"
+    tail -n 100 /var/lib/postgresql/data/log/postgresql-*.log || true
+  fi
+  exit 1
+fi
 
-# Check if PostgreSQL is running
-for i in {1..15}; do
-    if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
-        echo "PostgreSQL is ready!"
-        break
-    fi
-    echo "Waiting... ($i/15)"
-    sleep 2
-done
+# Create database (idempotent)
+echo "[startup] Ensuring database (${DB_NAME}) exists..."
+if ! sudo -u postgres "${PG_BIN}/psql" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${DB_NAME}'" | grep -q 1; then
+  sudo -u postgres "${PG_BIN}/createdb" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" "${DB_NAME}"
+else
+  echo "[startup] Database ${DB_NAME} already exists."
+fi
 
-# Create database and user
-echo "Setting up database and user..."
-sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || echo "Database might already exist"
-
-# Set up user and permissions with proper schema ownership
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d postgres << EOF
--- Create user if doesn't exist
+# Create/ensure user and permissions
+echo "[startup] Ensuring user (${DB_USER}) and permissions..."
+sudo -u postgres "${PG_BIN}/psql" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" -d postgres << EOF
 DO \$\$
 BEGIN
     IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${DB_USER}') THEN
@@ -87,73 +106,47 @@ BEGIN
 END
 \$\$;
 
--- Grant database-level permissions
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
+EOF
 
--- Connect to the specific database for schema-level permissions
-\c ${DB_NAME}
-
--- For PostgreSQL 15+, we need to handle public schema permissions differently
--- First, grant usage on public schema
+# Schema-level grants
+sudo -u postgres "${PG_BIN}/psql" -h 127.0.0.1 -p "${INTERNAL_PG_PORT}" -d "${DB_NAME}" << EOF
 GRANT USAGE ON SCHEMA public TO ${DB_USER};
-
--- Grant CREATE permission on public schema
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
-
--- Make the user owner of all future objects they create in public schema
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
-
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
--- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
-
--- Ensure the user can work with any existing objects
 GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO ${DB_USER};
 GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
-EOF
-
-# Additionally, connect to the specific database to ensure permissions
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
--- Double-check permissions are set correctly in the target database
-GRANT ALL ON SCHEMA public TO ${DB_USER};
-GRANT CREATE ON SCHEMA public TO ${DB_USER};
 
 -- Show current permissions for debugging
-\dn+ public
+\\dn+ public
 EOF
 
-# Save connection command to a file
-echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
-echo "Connection string saved to db_connection.txt"
+# Save connection command to a file (internal port)
+echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${INTERNAL_PG_PORT}/${DB_NAME}" > db_connection.txt
+echo "[startup] Connection string saved to db_connection.txt"
 
-# Save environment variables to a file
+# Save environment variables for optional local viewer (internal port)
 cat > db_visualizer/postgres.env << EOF
-export POSTGRES_URL="postgresql://localhost:${DB_PORT}/${DB_NAME}"
+export POSTGRES_URL="postgresql://localhost:${INTERNAL_PG_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
 export POSTGRES_PASSWORD="${DB_PASSWORD}"
 export POSTGRES_DB="${DB_NAME}"
-export POSTGRES_PORT="${DB_PORT}"
+export POSTGRES_PORT="${INTERNAL_PG_PORT}"
 EOF
 
-echo "PostgreSQL setup complete!"
-echo "Database: ${DB_NAME}"
-echo "User: ${DB_USER}"
-echo "Port: ${DB_PORT}"
+echo "[startup] PostgreSQL setup complete!"
+echo "[startup] Database: ${DB_NAME}"
+echo "[startup] User: ${DB_USER}"
+echo "[startup] Internal Port: ${INTERNAL_PG_PORT}"
 echo ""
-
-echo "Environment variables saved to db_visualizer/postgres.env"
-echo "Optional local viewer:"
-echo "  - The Node.js DB viewer is NOT started by this container."
-echo "  - To use locally (not in-container):"
-echo "      cd db_visualizer && source postgres.env && npm install && npm run start"
-
-echo "To connect to the database, use one of the following commands:"
-echo "psql -h localhost -U ${DB_USER} -d ${DB_NAME} -p ${DB_PORT}"
-echo "$(cat db_connection.txt)"
+echo "[startup] Optional local viewer (not started here):"
+echo "  cd db_visualizer && source postgres.env && npm install && npm run start"
+echo ""
+echo "[startup] To connect from inside container:"
+echo "  psql -h 127.0.0.1 -U ${DB_USER} -d ${DB_NAME} -p ${INTERNAL_PG_PORT}"
+echo "  $(cat db_connection.txt)"
