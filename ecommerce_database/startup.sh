@@ -2,6 +2,7 @@
 set -euo pipefail
 
 # Minimal PostgreSQL startup script with robust readiness checks.
+# This container runs ONLY PostgreSQL. No Node/Express or other processes are started here.
 # Internal Postgres will listen on standard port 5432 and all interfaces.
 # External port mapping (e.g., 3020->5432) is handled by the platform.
 
@@ -79,10 +80,11 @@ sudo -u postgres "${PG_BIN}/postgres" \
 if ! wait_for_ready 30 2; then
   echo "[startup][error] PostgreSQL did not become ready on 127.0.0.1:${INTERNAL_PG_PORT} within timeout."
   # Try to print last few lines of server log if available
-  if [ -f "/var/lib/postgresql/data/log/postgresql-%Y-%m-%d_%H%M%S.log" ]; then
+  if ls /var/lib/postgresql/data/log/postgresql-*.log >/dev/null 2>&1; then
     echo "[startup] Recent PostgreSQL logs:"
     tail -n 100 /var/lib/postgresql/data/log/postgresql-*.log || true
   fi
+  # Ensure we fail the container startup if DB isn't ready
   exit 1
 fi
 
@@ -131,6 +133,7 @@ echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@127.0.0.1:${INTERNAL_PG_PORT}/
 echo "[startup] Connection string saved to db_connection.txt"
 
 # Save environment variables for optional local viewer (internal port)
+# Note: The viewer is optional and must NOT be started by this container.
 cat > db_visualizer/postgres.env << EOF
 export POSTGRES_URL="postgresql://localhost:${INTERNAL_PG_PORT}/${DB_NAME}"
 export POSTGRES_USER="${DB_USER}"
@@ -143,9 +146,6 @@ echo "[startup] PostgreSQL setup complete!"
 echo "[startup] Database: ${DB_NAME}"
 echo "[startup] User: ${DB_USER}"
 echo "[startup] Internal Port: ${INTERNAL_PG_PORT}"
-echo ""
-echo "[startup] Optional local viewer (not started here):"
-echo "  cd db_visualizer && source postgres.env && npm install && npm run start"
 echo ""
 echo "[startup] To connect from inside container:"
 echo "  psql -h 127.0.0.1 -U ${DB_USER} -d ${DB_NAME} -p ${INTERNAL_PG_PORT}"
